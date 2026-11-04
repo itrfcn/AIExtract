@@ -1,0 +1,57 @@
+# ============================
+# Python 标准忽略
+# ============================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+*.whl
+.eggs/
+
+# 测试/静态分析缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# ============================
+# 虚拟环境（保留 .venv/）
+# ============================
+.venv/
+venv/
+env/
+.env
+!.env.example
+
+# ============================
+# 运行时 / 输出产物
+# ============================
+outputs/
+*.db
+*.sqlite3
+*.log
+*.tmp
+
+# ============================
+# 数据目录：保留样例，忽略运行时
+# ============================
+data/uploads/
+data/sample/
+data/jobs.db
+
+# ============================
+# Streamlit / IDE / 系统
+# ============================
+.streamlit/secrets.toml
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+.screenshots/
