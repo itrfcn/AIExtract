@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import re
+import threading
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -166,26 +168,70 @@ def _records_from_uploads(uploaded_files, pasted_text: str, mode: str):
 
 def start_job(mode: str, table_path: Path, sheet: str, header_row: int,
               specs: list[FieldSpec], records, concurrency: int, threshold: float,
-              meta: dict | None = None) -> tuple[str, dict]:
+              meta: dict | None = None) -> str:
+    """启动后台线程跑批量抽取。立即返回 job_id，进度通过 autorefresh 从 SQLite 读。"""
     job_id = store.create_job(mode, str(table_path), sheet, header_row, specs, meta=meta)
     store.add_items(job_id, [
         {"source_name": r.source_name, "record_id": r.record_id, "name_hint": r.name_hint, "text": r.text}
         for r in records
     ])
-    progress = st.progress(0.0, text="准备抽取...")
-    status_line = st.empty()
 
-    def callback(done: int, total: int, outcome: dict) -> None:
-        progress.progress(min(1.0, done / max(1, total)), text=f"已完成 {done}/{total} 条")
-        status_line.caption(
-            f"最近：{outcome.get('source_name') or '文本'} · "
-            f"{outcome.get('status')} · {outcome.get('name_hint') or outcome.get('record_id') or ''}"
-        )
+    def _worker() -> None:
+        try:
+            # 不传 progress_cb —— 前端靠 autorefresh 从 SQLite 读进度
+            run_batch(job_id, specs, get_provider(), concurrency=concurrency,
+                      threshold=threshold, progress_cb=None)
+        except Exception as exc:  # noqa: BLE001
+            # 兜底：整个批次异常也把 job 标 failed
+            store.update_job_status(job_id, "failed")
 
-    stats = run_batch(job_id, specs, get_provider(), concurrency=concurrency,
-                      threshold=threshold, progress_cb=callback)
-    progress.progress(1.0, text=f"抽取完成：成功 {stats['done']} 条，失败 {stats['failed']} 条")
-    return job_id, stats
+    t = threading.Thread(target=_worker, name=f"tiqu-batch-{job_id[:8]}", daemon=True)
+    t.start()
+    return job_id
+
+
+def render_job_progress(job_id: str, specs: list[FieldSpec], key_prefix: str,
+                        concurrency: int, threshold: float,
+                        is_manual: bool = False, manual_headers: list[str] | None = None) -> None:
+    """后台任务进度 + autorefresh + 完成后进入 review。"""
+    job = store.get_job(job_id)
+    if not job:
+        st.warning(f"任务 {job_id[:8]} 不存在")
+        return
+
+    stats = store.job_stats(job_id)
+    total = stats.get("total", 0)
+    done = stats.get("done", 0)
+    failed = stats.get("failed", 0)
+    pending = stats.get("pending", 0)
+    running = stats.get("running", 0)
+
+    progress = st.progress(
+        min(1.0, (done + failed) / max(1, total)),
+        text=f"抽取中 · 已完成 {done}/{total} · 失败 {failed} · 进行中 {running}",
+    )
+    cols = st.columns(4)
+    cols[0].metric("总计", total)
+    cols[1].metric("完成", done)
+    cols[2].metric("失败", failed)
+    cols[3].metric("进行中", running)
+
+    status = job.get("status", "pending")
+
+    if status in ("pending", "running"):
+        st.info("⏳ 后台线程运行中... 每 3 秒自动刷新。可以切 tab 或关闭页面重开，任务历史里仍能查看。")
+        st.caption(f"任务 ID: {job_id[:8]}  ·  并发 {concurrency}  ·  阈值 {threshold}")
+        time.sleep(3)
+        st.rerun()
+        return
+
+    if status == "failed":
+        st.error(f"❌ 任务失败：{job.get('counts', {}).get('error', '未知错误')}")
+        return
+
+    # status == "done" —— 进入复核
+    progress.progress(1.0, text=f"✅ 完成：成功 {done} 条，失败 {failed} 条")
+    st.rerun()
 
 
 def render_job_review(job_id: str, specs: list[FieldSpec], key_prefix: str,
@@ -215,14 +261,17 @@ def render_job_review(job_id: str, specs: list[FieldSpec], key_prefix: str,
                 width="stretch", hide_index=True,
             )
         if st.button("只重跑失败项", key=f"{key_prefix}_retry"):
-            progress = st.progress(0.0, text="重跑失败项...")
+            def _retry_worker() -> None:
+                try:
+                    retry_failed(job_id, specs, get_provider(),
+                                 concurrency=concurrency, threshold=threshold,
+                                 progress_cb=None)
+                except Exception as exc:  # noqa: BLE001
+                    store.update_job_status(job_id, "failed")
 
-            def cb(done, total, outcome):
-                progress.progress(min(1.0, done / max(1, total)),
-                                  text=f"重跑 {done}/{total} · {outcome.get('status')}")
-
-            retry_failed(job_id, specs, get_provider(), concurrency=concurrency,
-                         threshold=threshold, progress_cb=cb)
+            threading.Thread(target=_retry_worker, name=f"tiqu-retry-{job_id[:8]}",
+                             daemon=True).start()
+            st.success("重跑已启动，页面自动刷新进度...")
             st.rerun()
 
     if not done_items:
@@ -476,7 +525,7 @@ with tab_a:
         sheet_for_job = "抽取结果" if is_manual else (info.sheet if info else "Sheet1")
 
         if records and enabled_specs and st.button("开始抽取", type="primary", key="a_run"):
-            job_id, stats = start_job(
+            job_id = start_job(
                 "A", table_path, sheet_for_job, header_row_for_job, specs, records,
                 concurrency, threshold,
                 meta={"is_manual": is_manual, "headers": headers_list if is_manual else None},
@@ -484,16 +533,74 @@ with tab_a:
             st.session_state["a_job_id"] = job_id
             st.session_state["a_is_manual"] = is_manual
             st.session_state["a_headers"] = headers_list if is_manual else None
-            st.success(f"抽取完成：成功 {stats['done']} 条，失败 {stats['failed']} 条")
+            st.success(f"任务已启动（{job_id[:8]}），页面自动刷新进度...")
+            st.rerun()
 
         job_id = st.session_state.get("a_job_id")
         if job_id:
             st.divider()
-            st.subheader("4. 复核与导出")
-            render_job_review(
-                job_id, specs, "a", concurrency, threshold,
-                is_manual=is_manual, manual_headers=headers_list if is_manual else None,
-            )
+            job = store.get_job(job_id)
+            status = job.get("status") if job else None
+
+            if status in ("pending", "running"):
+                st.subheader("3. 抽取进度")
+                render_job_progress(
+                    job_id, specs, "a", concurrency, threshold,
+                    is_manual=is_manual, manual_headers=headers_list if is_manual else None,
+                )
+            elif status == "done":
+                st.subheader("4. 复核与导出")
+                render_job_review(
+                    job_id, specs, "a", concurrency, threshold,
+                    is_manual=is_manual, manual_headers=headers_list if is_manual else None,
+                )
+            elif status == "failed":
+                st.subheader("4. 复核与导出")
+                render_job_review(
+                    job_id, specs, "a", concurrency, threshold,
+                    is_manual=is_manual, manual_headers=headers_list if is_manual else None,
+                )
+            else:
+                st.info("任务不存在或未启动")
+
+def render_tab_b_batch(b_results: list[dict], concurrency: int, threshold: float) -> None:
+    """Tab B 批量任务的状态 + autorefresh + 复核。"""
+    st.divider()
+    active = [r for r in b_results if r["job_id"]]
+
+    if active:
+        job_statuses = [store.get_job(r["job_id"]) or {} for r in active]
+        done_count = sum(1 for j in job_statuses if j.get("status") in ("done", "partial"))
+        failed_count = sum(1 for j in job_statuses if j.get("status") == "failed")
+        active_count = len(active) - done_count - failed_count
+        cols = st.columns(4)
+        cols[0].metric("总表数", len(active))
+        cols[1].metric("完成", done_count)
+        cols[2].metric("失败", failed_count)
+        cols[3].metric("进行中", active_count)
+
+        if active_count > 0:
+            st.info("⏳ 后台线程运行中... 每 3 秒自动刷新。可以切 tab 或关闭页面重开。")
+            time.sleep(3)
+            st.rerun()
+            return
+
+    st.subheader("批量结果复核")
+    for index, result in enumerate(b_results):
+        if result.get("error"):
+            st.error(f"{result['name']}：{result['error']}")
+            continue
+        stats = store.job_stats(result["job_id"])
+        status = (store.get_job(result["job_id"]) or {}).get("status")
+        with st.expander(
+            f"{result['name']} · {status} · 成功 {stats['done']} / 失败 {stats['failed']} / 共 {stats['total']}",
+            expanded=(index == 0),
+        ):
+            if status in ("pending", "running"):
+                st.info("该表还在后台抽取中...")
+            else:
+                render_job_review(result["job_id"], result["specs"], f"b{index}", concurrency, threshold)
+
 
 # ---------------------------------------------------------------- Tab B
 
@@ -523,10 +630,9 @@ with tab_b:
 
         if st.button("批量成对抽取", type="primary", key="b_run"):
             b_results = []
-            overall = st.progress(0.0, text="准备批量任务...")
-            for i, (table, text_source) in enumerate(pairs):
-                table_path = save_upload(table)
+            for table, text_source in pairs:
                 try:
+                    table_path = save_upload(table)
                     info = cached_inspect(str(table_path), None, None)
                     text_path = save_upload(text_source)
                     text, warnings = read_text_file(text_path)
@@ -537,7 +643,7 @@ with tab_b:
                         b_results.append({"name": table.name, "job_id": None, "specs": [],
                                           "error": "文本为空或未切出记录"})
                         continue
-                    job_id, stats = start_job(
+                    job_id = start_job(
                         "B", table_path, info.sheet, int(info.header_row), specs, records,
                         concurrency, threshold,
                         meta={"text_source": text_source.name, "warnings": warnings},
@@ -545,24 +651,13 @@ with tab_b:
                     b_results.append({"name": table.name, "job_id": job_id, "specs": specs, "error": None})
                 except Exception as exc:  # noqa: BLE001
                     b_results.append({"name": table.name, "job_id": None, "specs": [], "error": str(exc)})
-                overall.progress((i + 1) / len(pairs), text=f"已完成 {i + 1}/{len(pairs)} 张表")
             st.session_state["b_results"] = b_results
-            overall.progress(1.0, text="批量抽取结束")
+            st.success(f"已启动 {len([r for r in b_results if r['job_id']])} 个后台任务，页面自动刷新进度...")
+            st.rerun()
 
         b_results = st.session_state.get("b_results")
         if b_results:
-            st.divider()
-            st.subheader("批量结果复核")
-            for index, result in enumerate(b_results):
-                if result.get("error"):
-                    st.error(f"{result['name']}：{result['error']}")
-                    continue
-                stats = store.job_stats(result["job_id"])
-                with st.expander(
-                    f"{result['name']} · 成功 {stats['done']} / 失败 {stats['failed']} / 共 {stats['total']}",
-                    expanded=(index == 0),
-                ):
-                    render_job_review(result["job_id"], result["specs"], f"b{index}", concurrency, threshold)
+            render_tab_b_batch(b_results, concurrency, threshold)
 
 # ---------------------------------------------------------------- Tab 历史
 

@@ -1,9 +1,13 @@
 """命令行入口：直接把表格和文本丢文件夹里跑，不需要 Streamlit。
 
 典型用法：
-    python cli.py                              # 自动扫描 data/ 样例跑一遍
-    python cli.py my_table.xlsx texts/*.txt    # 指定一张表 + 多个文本（模式 A）
-    python cli.py --pair t1.xlsx:a.txt t2.xlsx:b.txt   # 成对批量（模式 B）
+    python cli.py                                     # 自动扫描 data/ 样例跑一遍
+    python cli.py table.xlsx text1.txt text2.docx     # 模式 A：一张表 + 多份文本
+    python cli.py my_folder                           # 直接丢文件夹，自动找表和文本
+    python cli.py --dir my_folder                     # 同上（显式 --dir）
+    python cli.py --pair t1.xlsx:a.txt --pair t2.xlsx:b.txt  # 模式 B：成对批量
+    python cli.py table.xlsx texts/*.txt --concurrency 8 --threshold 0.6  # 调并发和阈值
+    python cli.py table.xlsx text.txt --provider ollama  # 强制指定 provider
 """
 
 from __future__ import annotations
@@ -80,7 +84,8 @@ def _scan_samples() -> tuple[Path, list[Path]] | None:
 
 # ---------- 主流程 ----------
 
-def run_single_batch(table_path: Path, text_paths: list[Path], provider) -> Path | None:
+def run_single_batch(table_path: Path, text_paths: list[Path], provider,
+                     concurrency: int | None = None, threshold: float | None = None) -> Path | None:
     """模式 A：一张表 + 多份文本（或多段文本文件）→ 追加多行。返回输出文件路径。"""
     _print_header(f"表格：{table_path.name}")
 
@@ -119,8 +124,8 @@ def run_single_batch(table_path: Path, text_paths: list[Path], provider) -> Path
     print(f"  {est['rough_cost_note']}")
 
     # 5. 并发抽取
-    threshold = settings.confidence_threshold
-    workers = max(1, min(16, settings.concurrency))
+    threshold = threshold if threshold is not None else settings.confidence_threshold
+    workers = max(1, min(16, concurrency if concurrency is not None else settings.concurrency))
     rows: list[dict] = []
     failed_count = 0
     all_empty_count = 0
@@ -180,12 +185,13 @@ def run_single_batch(table_path: Path, text_paths: list[Path], provider) -> Path
     return result.path
 
 
-def run_pair(table_text_pairs: list[tuple[Path, Path]], provider) -> None:
+def run_pair(table_text_pairs: list[tuple[Path, Path]], provider,
+             concurrency: int | None = None, threshold: float | None = None) -> None:
     """模式 B：多张表各自配对自己的文本，成对跑。"""
     _print_header(f"成对批量，共 {len(table_text_pairs)} 对")
     for table_path, text_path in table_text_pairs:
         try:
-            run_single_batch(table_path, [text_path], provider)
+            run_single_batch(table_path, [text_path], provider, concurrency=concurrency, threshold=threshold)
         except Exception as exc:  # noqa: BLE001
             print(f"  ! 失败 {table_path.name} ← {text_path.name}: {exc}")
 
@@ -210,6 +216,10 @@ def _parse_args() -> argparse.Namespace:
                    help="成对表:text，可多次。例：--pair a.xlsx:1.txt --pair b.xlsx:2.txt")
     p.add_argument("--provider", choices=["auto", "openai", "deepseek", "ollama"], default="auto",
                    help="强制指定 provider（默认 auto 读 .env）")
+    p.add_argument("--concurrency", type=int, default=None, metavar="N",
+                   help="并发线程数 1-16，默认读 .env（BATCH_CONCURRENCY），否则默认 4")
+    p.add_argument("--threshold", type=float, default=None, metavar="T",
+                   help="置信度阈值 0.3-0.95，默认读 .env（CONFIDENCE_THRESHOLD），否则默认 0.75")
     p.add_argument("--dir", type=str, default=None, metavar="FOLDER",
                    help="指定一个文件夹：自动找第一张 xlsx/csv + 所有文本文件")
     return p.parse_args()
@@ -255,7 +265,9 @@ def main() -> int:
     print(f"  provider : {settings.provider_label}")
     print(f"  data_dir : {settings.data_dir}")
     print(f"  output_dir: {settings.output_dir}")
-    print(f"  concurrency={settings.concurrency}  threshold={settings.confidence_threshold}")
+    concurrency = args.concurrency if args.concurrency is not None else settings.concurrency
+    threshold = args.threshold if args.threshold is not None else settings.confidence_threshold
+    print(f"  concurrency={concurrency}  threshold={threshold}")
 
     # ---------- 文件夹模式：--dir 参数或 positional 里的目录 ----------
     folder: Path | None = None
@@ -280,7 +292,7 @@ def main() -> int:
             print(f"  ! {folder} 里没找到支持的文本文件（txt/docx/pdf/xlsx/md/csv）")
             return 2
         print(f"  文件夹扫描 → 表={table.name}  文本={[t.name for t in texts]}")
-        run_single_batch(table, texts, provider)
+        run_single_batch(table, texts, provider, concurrency=concurrency, threshold=threshold)
         return 0
 
     # 模式 B：成对
@@ -299,7 +311,7 @@ def main() -> int:
                 print(f"  ! 文本文件不存在：{xp}")
                 return 2
             pairs.append((tp, xp))
-        run_pair(pairs, provider)
+        run_pair(pairs, provider, concurrency=concurrency, threshold=threshold)
         return 0
 
     # 模式 A：混合列表 or 无参扫描
@@ -318,9 +330,9 @@ def main() -> int:
         if len(tables) > 1:
             # 多张表但没 --pair，退化成"每张表单独跑，用全部文本"
             for t in tables:
-                run_single_batch(t, texts, provider)
+                run_single_batch(t, texts, provider, concurrency=concurrency, threshold=threshold)
             return 0
-        run_single_batch(tables[0], texts, provider)
+        run_single_batch(tables[0], texts, provider, concurrency=concurrency, threshold=threshold)
         return 0
 
     # 无参：自动扫描 data/
@@ -330,7 +342,7 @@ def main() -> int:
         return 1
     table, texts = scan
     print(f"  自动扫描 → 表={table.name}  文本={[t.name for t in texts]}")
-    run_single_batch(table, texts, provider)
+    run_single_batch(table, texts, provider, concurrency=concurrency, threshold=threshold)
     return 0
 
 
