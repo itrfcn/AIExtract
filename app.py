@@ -587,4 +587,80 @@ with tab_history:
             for j in jobs
         ])
         st.dataframe(df, width="stretch", hide_index=True)
+
+        st.divider()
+        st.subheader("下载任务结果")
+        col_sel, col_btn = st.columns([3, 1])
+        with col_sel:
+            selected_job_id = st.selectbox(
+                "选择任务", [j["job_id"] for j in jobs],
+                format_func=lambda jid: (next(
+                    f"{j['job_id']} · {j['created_at'][:16]} · {Path(j['table_path']).name}"
+                    for j in jobs if j["job_id"] == jid
+                )),
+                key="hist_sel_job",
+            )
+        with col_btn:
+            selected_job = store.get_job(selected_job_id)
+            st.caption(" ")
+            if st.button("加载结果", key="hist_load"):
+                st.session_state["hist_items"] = store.fetch_items(selected_job_id)
+
+        items = st.session_state.get("hist_items", [])
+        if not items or st.session_state.get("hist_loaded_for") != selected_job_id:
+            items = store.fetch_items(selected_job_id)
+            st.session_state["hist_items"] = items
+            st.session_state["hist_loaded_for"] = selected_job_id
+
+        if not items:
+            st.info("该任务没有可下载的记录。")
+        else:
+            specs = selected_job["specs"] if selected_job else []
+            enabled_specs = [s for s in specs if s.enabled]
+            headers_list = selected_job.get("meta", {}).get("headers") or [s.header for s in enabled_specs]
+
+            # 拼成 DataFrame（同 render_job_review 的格式）
+            rows = []
+            for it in items:
+                result = it.get("result") or {}
+                row = {}
+                for spec, header in zip(enabled_specs, headers_list[:len(enabled_specs)]):
+                    cell = result.get(spec.key, {}) if isinstance(result, dict) else {}
+                    val = cell.get("value")
+                    if isinstance(val, list):
+                        val = "、".join(str(v) for v in val)
+                    row[header] = val
+                rows.append(row)
+            out_df = pd.DataFrame(rows, columns=headers_list[:len(enabled_specs)] or [s.header for s in enabled_specs])
+
+            st.dataframe(out_df, width="stretch", hide_index=True)
+            st.caption(f"共 {len(out_df)} 条记录，字段 {len(enabled_specs)} 列")
+
+            if not out_df.empty:
+                # 生成 CSV / XLSX 两种下载选项
+                from io import BytesIO
+
+                # CSV
+                csv_bytes = out_df.to_csv(index=False).encode("utf-8-sig")
+                st.download_button(
+                    "下载 CSV（utf-8-sig，Excel 直接打开不乱码）",
+                    data=csv_bytes,
+                    file_name=f"抽取结果_{selected_job_id[:8]}.csv",
+                    mime="text/csv",
+                    key="hist_dl_csv",
+                )
+
+                # XLSX
+                buf = BytesIO()
+                with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                    out_df.to_excel(writer, index=False, sheet_name="抽取结果")
+                xlsx_bytes = buf.getvalue()
+                st.download_button(
+                    "下载 XLSX",
+                    data=xlsx_bytes,
+                    file_name=f"抽取结果_{selected_job_id[:8]}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="hist_dl_xlsx",
+                )
+
         st.caption("逐条状态（pending/running/done/failed）实时写入 data/jobs.db，失败项可在对应任务中重跑。")

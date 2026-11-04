@@ -198,17 +198,37 @@ def _parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例：
-  python cli.py                               # 扫描 data/ 样例跑一遍
-  python cli.py table.xlsx text1.txt text2.txt    # 模式 A：一张表 + 多份文本
+  python cli.py                                     # 自动扫描 data/ 样例跑一遍
+  python cli.py table.xlsx text1.txt text2.txt      # 模式 A：一张表 + 多份文本
+  python cli.py my_folder                           # 直接丢文件夹，自动找表和文本
+  python cli.py --dir my_folder                     # 同上（显式 --dir）
   python cli.py --pair t1.xlsx:a.txt t2.xlsx:b.txt  # 模式 B：成对批量
 """,
     )
-    p.add_argument("positional", nargs="*", help="表和文本文件的混合列表（模式 A）")
+    p.add_argument("positional", nargs="*", help="文件或文件夹路径（文件夹自动扫描）")
     p.add_argument("--pair", action="append", default=[],
                    help="成对表:text，可多次。例：--pair a.xlsx:1.txt --pair b.xlsx:2.txt")
     p.add_argument("--provider", choices=["auto", "openai", "deepseek", "ollama"], default="auto",
                    help="强制指定 provider（默认 auto 读 .env）")
+    p.add_argument("--dir", type=str, default=None, metavar="FOLDER",
+                   help="指定一个文件夹：自动找第一张 xlsx/csv + 所有文本文件")
     return p.parse_args()
+
+
+def _scan_folder(folder: Path) -> tuple[Path | None, list[Path]]:
+    """扫描一个文件夹：找第一张 xlsx/csv + 所有文本文件。返回 (table, [texts])。"""
+    tables = sorted(
+        p for p in folder.glob("*.xlsx")
+        if not p.name.startswith("~$") and "filled" not in p.stem.lower()
+    ) + sorted(
+        p for p in folder.glob("*.csv")
+        if not p.name.startswith("~$") and "filled" not in p.stem.lower()
+    )
+    texts = sorted(
+        p for p in folder.iterdir()
+        if p.is_file() and is_supported_text_file(p.name) and p.suffix.lower() != ".xlsx"
+    )
+    return (tables[0] if tables else None, texts)
 
 
 def main() -> int:
@@ -236,6 +256,32 @@ def main() -> int:
     print(f"  data_dir : {settings.data_dir}")
     print(f"  output_dir: {settings.output_dir}")
     print(f"  concurrency={settings.concurrency}  threshold={settings.confidence_threshold}")
+
+    # ---------- 文件夹模式：--dir 参数或 positional 里的目录 ----------
+    folder: Path | None = None
+    if args.dir:
+        folder = Path(args.dir)
+    elif args.positional:
+        dirs = [Path(f) for f in args.positional if Path(f).is_dir()]
+        if dirs:
+            folder = dirs[0]
+            # positional 里剩下的文件正常处理
+            args.positional = [str(f) for f in args.positional if not Path(f).is_dir()]
+
+    if folder is not None:
+        if not folder.exists():
+            print(f"  ! 文件夹不存在：{folder}")
+            return 2
+        table, texts = _scan_folder(folder)
+        if not table:
+            print(f"  ! {folder} 里没找到 xlsx/csv 表格文件")
+            return 2
+        if not texts:
+            print(f"  ! {folder} 里没找到支持的文本文件（txt/docx/pdf/xlsx/md/csv）")
+            return 2
+        print(f"  文件夹扫描 → 表={table.name}  文本={[t.name for t in texts]}")
+        run_single_batch(table, texts, provider)
+        return 0
 
     # 模式 B：成对
     if args.pair:
