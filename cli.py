@@ -7,6 +7,12 @@
     python cli.py --dir my_folder                     # 同上（显式 --dir）
     python cli.py --pair t1.xlsx:a.txt --pair t2.xlsx:b.txt  # 模式 B：成对批量
     python cli.py table.xlsx texts/*.txt --concurrency 8 --threshold 0.6  # 调并发和阈值
+    python cli.py --dir my_folder --split page         # 按 PDF 页拆分（默认；一页一份简历）
+    python cli.py --dir my_folder --split none         # 整个文件算一条（多页单份简历用）
+    python cli.py --dir my_folder --split auto         # 自动判断（单人简历不拆，多人才拆）
+    python cli.py --dir my_folder --split blank        # 按空行拆分（一个文件多人时用）
+    python cli.py --dir my_folder --split name         # 按「姓名」标签拆分
+    python cli.py --dir my_folder                      # 默认按 PDF 页拆：一页一条；非 PDF 仍是一文件一条
     python cli.py table.xlsx text.txt --provider ollama  # 强制指定 provider
 """
 
@@ -85,8 +91,12 @@ def _scan_samples() -> tuple[Path, list[Path]] | None:
 # ---------- 主流程 ----------
 
 def run_single_batch(table_path: Path, text_paths: list[Path], provider,
-                     concurrency: int | None = None, threshold: float | None = None) -> Path | None:
-    """模式 A：一张表 + 多份文本（或多段文本文件）→ 追加多行。返回输出文件路径。"""
+                     concurrency: int | None = None, threshold: float | None = None,
+                     mode: str = "none") -> Path | None:
+    """模式 A：一张表 + 多份文本（或多段文本文件）→ 追加多行。返回输出文件路径。
+
+    mode: none 每个文件整段一条（默认）；blank 按空行切；name 按「姓名」标签切。
+    """
     _print_header(f"表格：{table_path.name}")
 
     # 1. 读表头、探测 header_row
@@ -108,8 +118,13 @@ def run_single_batch(table_path: Path, text_paths: list[Path], provider,
     # 3. 读 + 切分所有文本
     all_records = []
     for tp in text_paths:
-        text, _warnings = read_text_file(tp)
-        recs = split_records(text, mode="auto", source_name=tp.name)
+        text, warnings = read_text_file(tp)
+        for warning in warnings:
+            print(f"  ! {tp.name}: {warning}")
+        recs = split_records(text, mode=mode, source_name=tp.name)
+        if mode != "page" and "\f" in text:
+            pages = text.count("\f") + 1
+            print(f"  ! {tp.name}: 这是 {pages} 页的 PDF，split={mode} 会合并成一条；如需一页一条请用 --split page")
         print(f"  文本 {tp.name} ({len(text)} 字) → {len(recs)} 条记录")
         all_records.extend(recs)
 
@@ -186,12 +201,14 @@ def run_single_batch(table_path: Path, text_paths: list[Path], provider,
 
 
 def run_pair(table_text_pairs: list[tuple[Path, Path]], provider,
-             concurrency: int | None = None, threshold: float | None = None) -> None:
+             concurrency: int | None = None, threshold: float | None = None,
+             mode: str = "none") -> None:
     """模式 B：多张表各自配对自己的文本，成对跑。"""
     _print_header(f"成对批量，共 {len(table_text_pairs)} 对")
     for table_path, text_path in table_text_pairs:
         try:
-            run_single_batch(table_path, [text_path], provider, concurrency=concurrency, threshold=threshold)
+            run_single_batch(table_path, [text_path], provider, concurrency=concurrency,
+                             threshold=threshold, mode=mode)
         except Exception as exc:  # noqa: BLE001
             print(f"  ! 失败 {table_path.name} ← {text_path.name}: {exc}")
 
@@ -209,11 +226,21 @@ def _parse_args() -> argparse.Namespace:
   python cli.py my_folder                           # 直接丢文件夹，自动找表和文本
   python cli.py --dir my_folder                     # 同上（显式 --dir）
   python cli.py --pair t1.xlsx:a.txt t2.xlsx:b.txt  # 模式 B：成对批量
+  python cli.py --dir my_folder --split page         # 按 PDF 页拆分（默认；一页一份简历）
+  python cli.py --dir my_folder --split none         # 整个文件算一条（多页单份简历用）
+  python cli.py --dir my_folder --split auto         # 自动判断（单人简历不拆）
+  python cli.py --dir my_folder --split blank        # 按空行拆分（一个文件多人时用）
+  python cli.py --dir my_folder --split name         # 按「姓名」标签拆分
+  python cli.py --dir my_folder                      # 默认按 PDF 页拆：一页一条
 """,
     )
     p.add_argument("positional", nargs="*", help="文件或文件夹路径（文件夹自动扫描）")
     p.add_argument("--pair", action="append", default=[],
                    help="成对表:text，可多次。例：--pair a.xlsx:1.txt --pair b.xlsx:2.txt")
+    p.add_argument("--split", choices=["none", "page", "auto", "blank", "name"], default="page",
+                   help="文本切分方式：page 按 PDF 页拆分（默认，一页一条；对非 PDF 文件等于一条）/ none 不拆分 / auto 自动判断 / blank 按空行 / name 按姓名标签")
+    p.add_argument("--single", action="store_true",
+                   help="等同 --split none（保留的简写）")
     p.add_argument("--provider", choices=["auto", "openai", "deepseek", "ollama"], default="auto",
                    help="强制指定 provider（默认 auto 读 .env）")
     p.add_argument("--concurrency", type=int, default=None, metavar="N",
@@ -267,7 +294,12 @@ def main() -> int:
     print(f"  output_dir: {settings.output_dir}")
     concurrency = args.concurrency if args.concurrency is not None else settings.concurrency
     threshold = args.threshold if args.threshold is not None else settings.confidence_threshold
-    print(f"  concurrency={concurrency}  threshold={threshold}")
+    mode = "none" if args.single else args.split
+    print(f"  concurrency={concurrency}  threshold={threshold}  split={mode}")
+    if settings.ocr_backend == "vision":
+        print(f"  ocr      : vision · {settings.vision_model}（并发 {settings.vision_concurrency}）")
+    else:
+        print("  ocr      : rapidocr（本地离线）")
 
     # ---------- 文件夹模式：--dir 参数或 positional 里的目录 ----------
     folder: Path | None = None
@@ -289,10 +321,11 @@ def main() -> int:
             print(f"  ! {folder} 里没找到 xlsx/csv 表格文件")
             return 2
         if not texts:
-            print(f"  ! {folder} 里没找到支持的文本文件（txt/docx/pdf/xlsx/md/csv）")
+            print(f"  ! {folder} 里没找到支持的文本文件（txt/doc/docx/pdf/xlsx/md/csv）")
             return 2
         print(f"  文件夹扫描 → 表={table.name}  文本={[t.name for t in texts]}")
-        run_single_batch(table, texts, provider, concurrency=concurrency, threshold=threshold)
+        run_single_batch(table, texts, provider, concurrency=concurrency,
+                         threshold=threshold, mode=mode)
         return 0
 
     # 模式 B：成对
@@ -311,7 +344,7 @@ def main() -> int:
                 print(f"  ! 文本文件不存在：{xp}")
                 return 2
             pairs.append((tp, xp))
-        run_pair(pairs, provider, concurrency=concurrency, threshold=threshold)
+        run_pair(pairs, provider, concurrency=concurrency, threshold=threshold, mode=mode)
         return 0
 
     # 模式 A：混合列表 or 无参扫描
@@ -330,9 +363,11 @@ def main() -> int:
         if len(tables) > 1:
             # 多张表但没 --pair，退化成"每张表单独跑，用全部文本"
             for t in tables:
-                run_single_batch(t, texts, provider, concurrency=concurrency, threshold=threshold)
+                run_single_batch(t, texts, provider, concurrency=concurrency,
+                                 threshold=threshold, mode=mode)
             return 0
-        run_single_batch(tables[0], texts, provider, concurrency=concurrency, threshold=threshold)
+        run_single_batch(tables[0], texts, provider, concurrency=concurrency,
+                         threshold=threshold, mode=mode)
         return 0
 
     # 无参：自动扫描 data/
@@ -342,7 +377,8 @@ def main() -> int:
         return 1
     table, texts = scan
     print(f"  自动扫描 → 表={table.name}  文本={[t.name for t in texts]}")
-    run_single_batch(table, texts, provider, concurrency=concurrency, threshold=threshold)
+    run_single_batch(table, texts, provider, concurrency=concurrency,
+                     threshold=threshold, mode=mode)
     return 0
 
 

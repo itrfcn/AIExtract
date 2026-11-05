@@ -153,12 +153,18 @@ def _spec_labels(specs: list[FieldSpec]) -> list[str]:
     return labels
 
 
+@st.cache_data(show_spinner="正在读取文本/识别扫描件...")
+def cached_read_text(path_str: str) -> tuple[str, list[str]]:
+    """上传文件按内容哈希命名，路径稳定；缓存后 rerun 不会重复 OCR（vision 有成本）。"""
+    return read_text_file(Path(path_str))
+
+
 def _records_from_uploads(uploaded_files, pasted_text: str, mode: str):
     records = []
     warnings: list[str] = []
     for uploaded in uploaded_files or []:
         path = save_upload(uploaded)
-        text, file_warnings = read_text_file(path)
+        text, file_warnings = cached_read_text(str(path))
         warnings.extend(f"{uploaded.name}：{w}" for w in file_warnings)
         records.extend(split_records(text, mode, source_name=uploaded.name))
     if (pasted_text or "").strip():
@@ -337,6 +343,7 @@ def render_job_review(job_id: str, specs: list[FieldSpec], key_prefix: str,
                 "置信度": cell.get("confidence"),
                 "证据": cell.get("evidence") or "",
                 "证据命中": cell.get("evidence_ok"),
+                "说明": cell.get("reason") or "",
             })
         st.dataframe(pd.DataFrame(evidence_rows), width="stretch", hide_index=True)
 
@@ -489,14 +496,22 @@ with tab_a:
 
     st.subheader("3. 添加文本")
     text_files = st.file_uploader(
-        "上传文本（可多选：txt / docx / pdf / xlsx）",
-        type=["txt", "md", "docx", "pdf", "xlsx", "xlsm"],
+        "上传文本（可多选：txt / doc / docx / pdf / 图片）",
+        type=["txt", "md", "doc", "docx", "pdf", "xlsx", "xlsm",
+              "png", "jpg", "jpeg", "bmp", "tif", "tiff", "webp"],
         accept_multiple_files=True,
         key="a_texts",
     )
     pasted = st.text_area("或直接粘贴文本（多段用空行分隔）", height=160, key="a_pasted")
-    mode_label = st.radio("记录切分", ["自动切分", "整段视为一条"], horizontal=True, key="a_mode")
-    split_mode = "auto" if mode_label == "自动切分" else "single"
+    mode_label = st.radio(
+        "记录切分（手动选择）",
+        ["按页拆分（PDF 一页一条，默认）", "不拆分（整个文件一条）", "自动判断", "按空行拆分", "按姓名拆分"],
+        horizontal=True, key="a_mode",
+    )
+    split_mode = {
+        "按页拆分（PDF 一页一条，默认）": "page", "不拆分（整个文件一条）": "none", "自动判断": "auto",
+        "按空行拆分": "blank", "按姓名拆分": "name",
+    }[mode_label]
 
     if table_path and specs:
         records, text_warnings = _records_from_uploads(text_files, pasted, split_mode)
@@ -608,10 +623,18 @@ with tab_b:
     st.subheader("多张表各自配文本，批量成对抽取")
     b_tables = st.file_uploader("上传多张表格", type=["xlsx", "xlsm", "csv"],
                                 accept_multiple_files=True, key="b_tables")
-    b_texts = st.file_uploader("上传多份文本", type=["txt", "md", "docx", "pdf", "xlsx", "xlsm"],
+    b_texts = st.file_uploader("上传多份文本", type=["txt", "md", "doc", "docx", "pdf", "xlsx", "xlsm",
+                                                "png", "jpg", "jpeg", "bmp", "tif", "tiff", "webp"],
                                accept_multiple_files=True, key="b_texts")
-    b_split = st.radio("文本切分", ["自动切分", "整段视为一条"], horizontal=True, key="b_mode")
-    split_mode_b = "auto" if b_split == "自动切分" else "single"
+    b_split = st.radio(
+        "文本切分（手动选择）",
+        ["按页拆分（PDF 一页一条，默认）", "不拆分（整个文件一条）", "自动判断", "按空行拆分", "按姓名拆分"],
+        horizontal=True, key="b_mode",
+    )
+    split_mode_b = {
+        "按页拆分（PDF 一页一条，默认）": "page", "不拆分（整个文件一条）": "none", "自动判断": "auto",
+        "按空行拆分": "blank", "按姓名拆分": "name",
+    }[b_split]
 
     if not b_tables or not b_texts:
         st.info("需要至少 1 张表和 1 份文本。每张表会按顺序匹配一份文本，可手动改对应关系。")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from datetime import date
 from typing import Any, Literal
 
 from pydantic import BaseModel
@@ -21,6 +22,7 @@ class CellResult(BaseModel):
     evidence_ok: bool | None = None
     status: CellStatus = "not_mentioned"
     reason: str = ""
+    derived: bool = False
 
 
 SYSTEM_PROMPT = """你是一个严谨的信息抽取器。你会收到一段关于人物的文本，以及一组需要抽取的字段。
@@ -31,8 +33,13 @@ SYSTEM_PROMPT = """你是一个严谨的信息抽取器。你会收到一段关�
    必须包含足够上下文（至少能唯一定位，建议 ≥ 6 字），避免只返回一个数字或姓名造成误匹配；没有 evidence 时返回 null。
 3. evidence 必须能直接支持 value：值是从 evidence 中读出来的，而不是猜出来的。
 4. 日期统一输出 ISO 格式（1993-04-12，仅有年月用 1993-04）；年龄只输出整数；多个值输出数组；性别只取 男/女/其他。
+   唯一允许的推算：字段是年龄、原文只给了出生年月时，可按当前年份计算周岁，evidence 必须引用出生年月原文；其他字段禁止任何推算。
 5. confidence 是 0-1 的数字，表示该值有明确原文支撑的把握程度；没有 evidence 时 confidence 必须为 0。
-6. 只输出一个 JSON 对象，键是字段 key，值是 {"value": ..., "confidence": ..., "evidence": ...}，不要输出任何解释。
+6. 文本可能是「候选人推荐报告」或简历：只抽取文本主角（候选人本人）的信息。
+   「推荐顾问」「推荐人」「招聘顾问」「推荐时间」「应聘企业」「联系人」「HR」等第三方信息一律不得作为候选人字段的值；
+   姓名必须是候选人本人（可能写在「姓名」标签里，也可能只是简历开头单独一行），绝不能取推荐顾问/联系人/公司名。
+7. 字段值必须与字段含义直接对应：不要把工作年限当成年龄、把毕业年份当出生日期、把学校当公司、把应聘职位当现任职位。
+8. 只输出一个 JSON 对象，键是字段 key，值是 {"value": ..., "confidence": ..., "evidence": ...}，不要输出任何解释。
 
 宁可漏抽，不可错抽。"""
 
@@ -173,6 +180,91 @@ def check_value_in_evidence(value: Any, raw_value: Any, evidence: str | None,
     return any(c in norm_target for c in candidates)
 
 
+# ---------- 候选人身份校验：推荐人/联系人不能当候选人 ----------
+
+_LABEL_NAME = re.compile(r"姓\s*名\s*[:：]\s*([\u4e00-\u9fa5·]{2,8})")
+_REFERRER_WORDS = ("推荐顾问", "推荐人", "招聘顾问", "联系人", "汇报对象", "对接人", "HR")
+_NAME_KEYS = {"name", "fullname", "full_name", "candidate_name", "person_name"}
+_AGE_KEYS = {"age", "年龄", "current_age"}
+_BIRTH_DATE = re.compile(r"((?:19|20)\d{2})\s*[年./\-]\s*(\d{1,2})")
+_BIRTH_LABEL = re.compile(
+    r"出生(?:日期|年月|时间|年份)?\s*[：:]\s*((?:19|20)\d{2})\s*(?:[年./\-]\s*(\d{1,2}))?"
+)
+
+
+def _age_from_birth(year: int, month: int | None) -> int | None:
+    today = date.today()
+    if month is None:
+        age = today.year - year
+    else:
+        age = today.year - year - ((today.month, today.day) < (month, 1))
+    return age if 14 <= age <= 80 else None
+
+
+def _is_age_spec(spec: FieldSpec) -> bool:
+    return spec.key.lower() in _AGE_KEYS or "年龄" in spec.header
+
+
+def _age_from_birth_evidence(evidence: str) -> int | None:
+    """从证据里的出生年月推算周岁；只接受 14-80 岁，避开毕业年份等数字。"""
+    match = _BIRTH_DATE.search(evidence or "")
+    if not match:
+        return None
+    year, month = int(match.group(1)), int(match.group(2))
+    if not 1 <= month <= 12:
+        return None
+    return _age_from_birth(year, month)
+
+
+def _birth_label_from_text(text: str) -> tuple[str, int, int | None] | None:
+    """从原文「出生日期：1983.1」这类显式标签取出生年月，返回 (原文片段, 年, 月)。"""
+    match = _BIRTH_LABEL.search(text or "")
+    if not match:
+        return None
+    snippet = match.group(0).strip()
+    year = int(match.group(1))
+    month = int(match.group(2)) if match.group(2) else None
+    if month is not None and not 1 <= month <= 12:
+        month = None
+    return snippet, year, month
+
+
+def _is_name_spec(spec: FieldSpec) -> bool:
+    """只认「姓名」类字段，避免把 company_name 之类误判成人名。"""
+    if any(hint in f"{spec.key}{spec.header}" for hint in ("姓名", "名字", "候选人")):
+        return True
+    return spec.key.lower() in _NAME_KEYS
+
+
+def _candidate_label_name(text: str) -> str | None:
+    """取原文里的「姓 名：xxx」，跳过「推荐人姓名：张丹」这类行。"""
+    for line in text.splitlines():
+        if any(word in line for word in _REFERRER_WORDS):
+            continue
+        match = _LABEL_NAME.search(line)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _plain(text: Any) -> str:
+    return re.sub(r"\s+", "", str(text or ""))
+
+
+def _value_is_referrer(value: Any, text: str) -> bool:
+    """值是否紧跟在「推荐顾问/联系人」等角色词后面（例：推荐顾问：张丹）。"""
+    target = _plain(value)
+    if not target:
+        return False
+    for line in text.splitlines():
+        flat = _plain(line)
+        for role in _REFERRER_WORDS:
+            idx = flat.find(role)
+            if idx != -1 and target in flat[idx:idx + len(role) + 8]:
+                return True
+    return False
+
+
 # ---------- 主流程 ----------
 
 def _as_float(value: Any, default: float = 0.0) -> float:
@@ -212,6 +304,58 @@ def extract_record(
             evidence = None
 
         value, normalized_ok, reason = normalize_value(raw_value, spec)
+
+        # 姓名列：以原文「姓名：xxx」标签为准，避免把推荐顾问/联系人写成候选人
+        if _is_name_spec(spec):
+            labelled = _candidate_label_name(text)
+            if labelled:
+                expected = labelled
+                if value is None:
+                    results[spec.key] = CellResult(
+                        value=expected, confidence=0.85, evidence=f"姓名：{expected}",
+                        evidence_ok=True, status="ok", reason="取自原文「姓名」标签",
+                    ).model_dump(mode="json")
+                    continue
+                if _plain(value) != _plain(expected):
+                    results[spec.key] = CellResult(
+                        value=expected, confidence=0.49, evidence=f"姓名：{expected}",
+                        evidence_ok=True, status="uncertain",
+                        reason="与原文「姓名」标签不一致，已按标签校正",
+                    ).model_dump(mode="json")
+                    continue
+            elif value is not None and (
+                (evidence and any(w in evidence for w in _REFERRER_WORDS))
+                or _value_is_referrer(value, text)
+            ):
+                results[spec.key] = CellResult(
+                    value=None, confidence=0.0, evidence=evidence,
+                    evidence_ok=False, status="uncertain",
+                    reason="疑似推荐人/联系人信息，已丢弃",
+                ).model_dump(mode="json")
+                continue
+
+        # 年龄缺失时，用原文显式「出生日期」兜底推算（其他字段不这么做）
+        if value is None and _is_age_spec(spec):
+            birth = _birth_label_from_text(text)
+            if birth:
+                snippet, birth_year, birth_month = birth
+                guessed = _age_from_birth(birth_year, birth_month)
+                if guessed is not None:
+                    if birth_month is None:
+                        results[spec.key] = CellResult(
+                            value=guessed, confidence=0.49, evidence=snippet,
+                            evidence_ok=True, status="uncertain", derived=True,
+                            reason="仅按出生年份推算，生日未知，可能相差 1 岁",
+                        ).model_dump(mode="json")
+                    else:
+                        results[spec.key] = CellResult(
+                            value=guessed, confidence=0.8, evidence=snippet,
+                            evidence_ok=True,
+                            status="ok" if 0.8 >= threshold else "uncertain",
+                            derived=True, reason="由出生年月推算（请核对）",
+                        ).model_dump(mode="json")
+                    continue
+
         if value is None:
             results[spec.key] = CellResult(
                 value=None,
@@ -225,6 +369,14 @@ def extract_record(
 
         evidence_ok = check_evidence(evidence, text)
         value_ok_in_evidence = check_value_in_evidence(value, raw_value, evidence, text, spec.type)
+
+        # 年龄是唯一允许推算的字段：原文只给出生年月时，按当前年份算周岁
+        derived = False
+        if value is not None and not value_ok_in_evidence and evidence and _is_age_spec(spec):
+            guessed = _age_from_birth_evidence(evidence)
+            if guessed is not None and str(guessed) == str(value):
+                value_ok_in_evidence = True
+                derived = True
 
         # evidence 长度惩罚：归一化后 < 6 字（上下文太少），扣 0.15
         evidence_len_penalty = 0.0
@@ -245,6 +397,10 @@ def extract_record(
             score = min(score, 0.49)
             reason = reason or "值未能在证据中反查命中"
 
+        if derived:
+            score = min(score, 0.8)
+            reason = "由出生年月推算（请核对）"
+
         status: CellStatus = "ok" if (evidence_ok and value_ok_in_evidence and normalized_ok and score >= threshold) else "uncertain"
         results[spec.key] = CellResult(
             value=value,
@@ -253,6 +409,7 @@ def extract_record(
             evidence_ok=evidence_ok,
             status=status,
             reason=reason,
+            derived=derived,
         ).model_dump(mode="json")
 
     return results

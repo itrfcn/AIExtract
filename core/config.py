@@ -51,6 +51,12 @@ class Settings:
     data_dir: Path = ROOT / "data"
     output_dir: Path = ROOT / "outputs"
     db_path: Path = ROOT / "data" / "jobs.db"
+    # OCR：vision = 云端视觉模型读页图（默认）；rapidocr = 本地离线 OCR
+    ocr_backend: str = "vision"
+    vision_model: str = ""
+    vision_concurrency: int = 4
+    vision_max_side: int = 1600
+    vision_fallback_local: bool = True
 
     @property
     def provider_label(self) -> str:
@@ -89,6 +95,12 @@ def _build_settings() -> Settings:
     output_dir = Path(_env("OUTPUT_DIR", str(ROOT / "outputs")))
     db_path = Path(_env("DB_PATH", str(data_dir / "jobs.db")))
 
+    ocr_backend = _env("OCR_BACKEND", "vision").lower() or "vision"
+    if ocr_backend not in ("vision", "rapidocr"):
+        raise ValueError(f"OCR_BACKEND={ocr_backend} 不支持；可选值：vision / rapidocr")
+    vision_model = _env("VISION_MODEL") or model
+    vision_fallback_local = _env("VISION_FALLBACK_LOCAL", "1").lower() in ("1", "true", "yes")
+
     return Settings(
         provider=provider,
         base_url=base_url,
@@ -102,6 +114,11 @@ def _build_settings() -> Settings:
         data_dir=data_dir,
         output_dir=output_dir,
         db_path=db_path,
+        ocr_backend=ocr_backend,
+        vision_model=vision_model,
+        vision_concurrency=max(1, min(8, _env_int("VISION_CONCURRENCY", 4))),
+        vision_max_side=max(800, min(3000, _env_int("VISION_MAX_SIDE", 1600))),
+        vision_fallback_local=vision_fallback_local,
     )
 
 
